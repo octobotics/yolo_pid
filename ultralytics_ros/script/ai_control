@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+
+import rospy
+from ultralytics_ros.msg import YoloResult
+from geometry_msgs.msg import Twist
+from vision_msgs.msg import Detection2DArray
+
+class AIControlNode:
+    def __init__(self):
+        rospy.init_node('ai_control_node', anonymous=True)
+
+        rospy.Subscriber('/yolo_result', YoloResult, self.yolo_result_callback)
+
+        self.cmd_vel_pub = rospy.Publisher('/skid_steer/cmd_vel', Twist, queue_size=10)
+
+        self.track_class_id = 0
+
+        self.Kp = 0.5
+        self.Ki = 0.0
+        self.Kd = 0.1
+        self.prev_error = 0.0
+        self.integral = 0.0
+
+        self.image_width = 1024
+
+    def yolo_result_callback(self, msg):
+        rospy.loginfo("Received YOLO result message")
+        rospy.loginfo("Number of detections: {}".format(len(msg.detections.detections)))
+        if len(msg.detections.detections) == 0:
+            rospy.loginfo("No detections found. Publishing zero velocity.")
+            self.publish_zero_velocity()
+        else:
+            for detection in msg.detections.detections:
+                rospy.loginfo("Detection ID: {}".format(detection.results[0].id))
+                if detection.results[0].id == self.track_class_id:
+                    rospy.loginfo("Detection: True")
+                    track_center_x = detection.bbox.center.x
+                    self.follow_track(track_center_x)
+                    return
+
+    def follow_track(self, track_center_x):
+        error = track_center_x - (self.image_width / 2)
+
+        self.integral += error
+
+        pid_output = self.Kp * error + self.Ki * self.integral + self.Kd * (error - self.prev_error)
+
+        self.prev_error = error
+
+        pid_output = max(min(pid_output, 1), -1)
+
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 1.0
+        cmd_vel.angular.z = pid_output
+
+        self.cmd_vel_pub.publish(cmd_vel)
+
+    def publish_zero_velocity(self):
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.0
+        cmd_vel.angular.z = 0.0
+        self.cmd_vel_pub.publish(cmd_vel)
+
+if __name__ == '__main__':
+    try:
+        ai_control_node = AIControlNode()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

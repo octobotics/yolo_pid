@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+
+import rospy
+from ultralytics_ros.msg import YoloResult
+from geometry_msgs.msg import Twist
+from vision_msgs.msg import Detection2DArray
+from geometry_msgs.msg import PoseStamped
+import tf
+import numpy as np
+
+class AIControlNode:
+    def __init__(self):
+        rospy.init_node('ai_control_node', anonymous=True)
+
+        rospy.Subscriber('/zed2i/zed_node/pose', PoseStamped, self.pose_callback)
+        rospy.Subscriber('/yolo_result', YoloResult, self.yolo_result_callback)
+
+        self.cmd_vel_pub = rospy.Publisher('/skid_steer/cmd_vel', Twist, queue_size=10)
+
+        self.track_class_id = 0
+        self.home_orientation = 0.0
+        self.Kp = 0.5
+        self.P = np.eye(3) 
+        self.Q = np.eye(3)  
+        self.R = np.eye(2)  
+
+        self.state = np.zeros(3)  
+        self.image_width = 1024
+
+    def pose_callback(self, msg):
+        quaternion = msg.pose.orientation
+        euler = tf.transformations.euler_from_quaternion([quaternion.x, quaternion.y, quaternion.z, quaternion.w])
+        self.home_orientation = euler[2]
+
+    def yolo_result_callback(self, msg):
+        rospy.loginfo("Received YOLO result message")
+        rospy.loginfo("Number of detections: {}".format(len(msg.detections.detections)))
+        
+        if len(msg.detections.detections) == 0:
+            rospy.loginfo("No detections found. Publishing zero velocity.")
+            self.publish_zero_velocity()
+        else:
+            for detection in msg.detections.detections:
+                rospy.loginfo("Detection ID: {}".format(detection.results[0].id))
+                if detection.results[0].id == self.track_class_id:
+                    rospy.loginfo("Detection: True")
+                    track_center_x = detection.bbox.center.x
+                    current_orientation = self.home_orientation  
+                    self.predict()
+                    self.update(np.array([track_center_x, 0]))  
+                    cmd_vel = self.calculate_control(self.state[0], self.state[1], self.state[2])
+                    self.cmd_vel_pub.publish(cmd_vel)
+                    return
+
+    def predict(self):
+        dt = 0.1
+        v = 0.2
+        w = 0.1
+        
+        F = np.array([[1, 0, -v*dt*np.sin(self.state[2])],
+                      [0, 1, v*dt*np.cos(self.state[2])],
+                      [0, 0, 1]])
+        self.P = F @ self.P @ F.T + self.Q
+
+        self.state[0] += v * dt * np.cos(self.state[2])
+        self.state[1] += v * dt * np.sin(self.state[2])
+        self.state[2] += w * dt
+
+    def update(self, measurement):
+        H = np.array([[1, 0, 0],
+                      [0, 0, 1]])
+        K = self.P @ H.T @ np.linalg.inv(H @ self.P @ H.T + self.R)
+        z = measurement - H @ self.state
+        self.state += K @ z
+        self.P = (np.eye(3) - K @ H) @ self.P
+
+    def calculate_control(self, x, y, theta):
+        desired_orientation = np.arctan2(y, x)
+        orientation_error = desired_orientation - theta
+        angular_velocity = self.Kp * orientation_error
+        angular_velocity = np.clip(angular_velocity, -1, 1)
+
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.2
+        cmd_vel.angular.z = angular_velocity
+
+        return cmd_vel
+
+    def publish_zero_velocity(self):
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.0
+        cmd_vel.angular.z = 0.0
+        self.cmd_vel_pub.publish(cmd_vel)
+
+if __name__ == '__main__':
+    try:
+        ai_control_node = AIControlNode()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
