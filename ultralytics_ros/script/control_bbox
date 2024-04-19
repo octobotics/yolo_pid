@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+import rospy
+import rosnode
+from ultralytics_ros.msg import YoloResult
+from geometry_msgs.msg import Twist
+from vision_msgs.msg import Detection2DArray
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Int32
+from std_srvs.srv import SetBool, SetBoolResponse
+import tf
+import numpy as np
+
+class AIControlNode:
+    def __init__(self):
+        rospy.init_node('ai_control_node', anonymous=True)
+
+        rospy.Subscriber('/zed2i/zed_node/pose', PoseStamped, self.pose_callback)
+        rospy.Subscriber('/yolo_result', YoloResult, self.yolo_result_callback)
+
+        self.cmd_vel_pub = rospy.Publisher('/skid_steer/cmd_vel', Twist, queue_size=10)
+
+        rospy.Subscriber('/navigation_control', Int32, self.navigation_control_callback)
+
+        self.home_orientation = 0.0
+        self.Kp = 0.5
+        self.Ki = 0.0
+        self.Kd = 0.1
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.image_width = 1024
+        self.navigation_enabled = False  
+        self.linear_velocity = 0.5  
+
+        self.set_linear_velocity_service = rospy.Service('/set_linear_velocity', SetBool, self.set_linear_velocity)
+
+        self.decrease_linear_velocity_service = rospy.Service('/decrease_linear_velocity', SetBool, self.decrease_linear_velocity)
+
+    def pose_callback(self, msg):
+        quaternion = msg.pose.orientation
+        euler = tf.transformations.euler_from_quaternion([quaternion.x, quaternion.y, quaternion.z, quaternion.w])
+        self.home_orientation = euler[2]
+
+    def yolo_result_callback(self, msg):
+        if self.navigation_enabled:  
+            track_bbox = None
+            for detection in msg.detections.detections:
+                track_bbox = detection.bbox
+                break  
+
+            if track_bbox is None:
+                self.publish_zero_velocity()
+                return
+
+            track_center_x = track_bbox.center.x
+            current_orientation = self.home_orientation  
+            self.follow_track(track_center_x, current_orientation)
+
+    def follow_track(self, track_center_x, current_orientation):
+        orientation_error = current_orientation - self.home_orientation
+        
+        if orientation_error > np.pi:
+            orientation_error -= 2 * np.pi
+        elif orientation_error < -np.pi:
+            orientation_error += 2 * np.pi
+
+        pid_output = self.Kp * (track_center_x - (self.image_width / 2)) + self.Ki * self.integral + self.Kd * (orientation_error - self.prev_error)
+        
+        self.prev_error = orientation_error
+        self.integral += orientation_error
+
+        pid_output = np.clip(pid_output, -1, 1)
+
+        cmd_vel = Twist()
+        
+        if abs(track_center_x - (self.image_width / 2)) < 10: 
+            rospy.loginfo("Going Straight")
+            cmd_vel.linear.x = self.linear_velocity  
+            cmd_vel.angular.z = 0.0
+        elif pid_output > 0:
+            rospy.loginfo("Turning Right")
+            cmd_vel.linear.x = self.linear_velocity
+            cmd_vel.angular.z = -1 * pid_output
+        else:
+            rospy.loginfo("Turning Left")
+            cmd_vel.linear.x = self.linear_velocity
+            cmd_vel.angular.z = -1 * pid_output
+
+        self.cmd_vel_pub.publish(cmd_vel)
+
+    def publish_zero_velocity(self):
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.0
+        cmd_vel.angular.z = 0.0
+        self.cmd_vel_pub.publish(cmd_vel)
+
+    def navigation_control_callback(self, msg):
+        if msg.data == 1:  
+            self.navigation_enabled = True
+            rospy.loginfo("Navigation enabled.")
+            rosnode.kill_nodes(['/joy_node'])
+            rospy.loginfo("joy_node killed.")
+        elif msg.data == 0:  
+            self.navigation_enabled = False
+            rospy.loginfo("Navigation disabled.")
+
+    def set_linear_velocity(self, req):
+        if req.data:  
+            if self.linear_velocity < 3.0:  
+                self.linear_velocity += 0.2
+            rospy.loginfo("Linear velocity set to: {}".format(self.linear_velocity))
+        else:
+            rospy.loginfo("Linear velocity unchanged: {}".format(self.linear_velocity))
+        return SetBoolResponse(success=True)
+
+    def decrease_linear_velocity(self, req):
+        if req.data:  
+            if self.linear_velocity > 0.5:  
+                self.linear_velocity -= 0.2
+            rospy.loginfo("Linear velocity set to: {}".format(self.linear_velocity))
+        else:
+            rospy.loginfo("Linear velocity unchanged: {}".format(self.linear_velocity))
+        return SetBoolResponse(success=True)
+
+if __name__ == '__main__':
+    try:
+        ai_control_node = AIControlNode()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass
